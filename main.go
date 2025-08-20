@@ -15,8 +15,8 @@ import (
 const (
 	configFileName   = "connect.json"
 	outputDir        = "date"
-	comSearchTimeout = 500 * time.Millisecond
-	tcpSearchTimeout = 2 * time.Second
+	comSearchTimeout = 220 * time.Millisecond
+	tcpSearchTimeout = 300 * time.Millisecond
 )
 
 // ConfigFile соответствует структуре файла connect.json

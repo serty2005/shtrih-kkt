@@ -452,15 +452,12 @@ func findOnComPort(portName string, timeout time.Duration) (*Config, error) {
 	}
 
 	// Стандартные скорости обмена для ККТ
-	baudRates := []int32{115200, 57600, 38400, 19200, 9600}
+	baudRates := []int32{115200, 4800}
 	// В документации BaudRate - это индекс от 0 до 6.
 	// 6 = 115200, 5 = 57600, 4 = 38400, 3 = 19200, 2 = 9600
 	baudRateIndexes := map[int32]int32{
 		115200: 6,
-		57600:  5,
-		38400:  4,
-		19200:  3,
-		9600:   2,
+		4800:   1,
 	}
 
 	for _, baud := range baudRates {
