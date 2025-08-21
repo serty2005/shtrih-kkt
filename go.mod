@@ -5,6 +5,7 @@ go 1.23.4
 require (
 	github.com/go-ole/go-ole v1.3.0
 	go.bug.st/serial v1.6.4
+	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 )
 
 require (

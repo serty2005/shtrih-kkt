@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -10,14 +11,20 @@ import (
 	"time"
 
 	"shtrih-kkt/pkg/shtrih"
+
+	"gopkg.in/natefinch/lumberjack.v2"
 )
 
 const (
-	configFileName   = "connect.json"
-	outputDir        = "date"
-	comSearchTimeout = 220 * time.Millisecond
-	tcpSearchTimeout = 300 * time.Millisecond
+	configFileName    = "connect.json"
+	serviceConfigName = "service.json"
+	outputDir         = "date"
+	logsDir           = "logs"
+	comSearchTimeout  = 200 * time.Millisecond // Уменьшенный таймаут
+	tcpSearchTimeout  = 150 * time.Millisecond
 )
+
+// --- СТРУКТУРЫ ДЛЯ ПАРСИНГА КОНФИГУРАЦИОННЫХ ФАЙЛОВ ---
 
 // ConfigFile соответствует структуре файла connect.json
 type ConfigFile struct {
@@ -35,6 +42,17 @@ type ConnectionSettings struct {
 	IPPort      string `json:"ip_port"`
 }
 
+// ServiceFile используется для чтения настроек логирования из service.json
+type ServiceFile struct {
+	Service ServiceConfig `json:"service"`
+}
+
+// ServiceConfig содержит параметры логирования
+type ServiceConfig struct {
+	LogLevel string `json:"log_level"`
+	LogDays  int    `json:"log_days"`
+}
+
 // PolledDevice связывает конфигурацию, использованную для подключения,
 // с фискальной информацией, полученной от устройства.
 type PolledDevice struct {
@@ -42,13 +60,15 @@ type PolledDevice struct {
 	Info   *shtrih.FiscalInfo
 }
 
+// --- ОСНОВНАЯ ЛОГИКА ПРИЛОЖЕНИЯ ---
+
 func main() {
 	log.Println("Запуск приложения для сбора данных с ККТ Штрих-М...")
 
 	configData, err := os.ReadFile(configFileName)
 	if err != nil {
 		if os.IsNotExist(err) {
-			log.Printf("Файл конфигурации '%s' не найден. Запускаю режим автопоиска устройств...", configFileName)
+			log.Printf("Файл конфигурации '%s' не найден. Запускаю режим автопоиска...", configFileName)
 			runDiscoveryMode()
 		} else {
 			log.Fatalf("Ошибка чтения файла конфигурации '%s': %v", configFileName, err)
@@ -61,11 +81,56 @@ func main() {
 	log.Println("Работа приложения завершена.")
 }
 
+// setupLogger настраивает запись логов в файл для стационарного режима.
+func setupLogger() {
+	data, err := os.ReadFile(serviceConfigName)
+	if err != nil {
+		log.Printf("Предупреждение: файл настроек '%s' не найден. Логирование продолжится в консоль.", serviceConfigName)
+		return
+	}
+
+	var serviceFile ServiceFile
+	if err := json.Unmarshal(data, &serviceFile); err != nil {
+		log.Printf("Предупреждение: не удалось прочитать настройки из '%s' (%v). Логирование продолжится в консоль.", serviceConfigName, err)
+		return
+	}
+
+	// Устанавливаем значения по умолчанию, если в файле их нет
+	logDays := serviceFile.Service.LogDays
+	if logDays <= 0 {
+		logDays = 7
+	}
+
+	// Создаем папку для логов, если ее нет
+	if err := os.MkdirAll(logsDir, 0755); err != nil {
+		log.Printf("Ошибка создания директории для логов '%s': %v. Логирование продолжится в консоль.", logsDir, err)
+		return
+	}
+
+	logFilePath := filepath.Join(logsDir, "shtrih-scanner.log")
+
+	// Настраиваем ротацию логов
+	lumberjackLogger := &lumberjack.Logger{
+		Filename:   logFilePath,
+		MaxSize:    5, // мегабайты
+		MaxBackups: 10,
+		MaxAge:     logDays, // дни
+		Compress:   true,    // сжимать старые файлы
+	}
+
+	// Устанавливаем вывод логов и в файл, и в консоль
+	log.SetOutput(io.MultiWriter(os.Stdout, lumberjackLogger))
+	log.Printf("Логирование настроено. Уровень: %s, ротация: %d дней. Файл: %s", serviceFile.Service.LogLevel, logDays, logFilePath)
+}
+
 func runConfigMode(data []byte) {
+	// Первым делом настраиваем логирование для стационарного режима!
+	setupLogger()
+
 	var configFile ConfigFile
 	if err := json.Unmarshal(data, &configFile); err != nil {
 		log.Printf("Ошибка парсинга JSON из '%s': %v. Переключаюсь на режим автопоиска.", configFileName, err)
-		runDiscoveryMode()
+		runDiscoveryMode() // В случае ошибки автопоиск будет логировать только в консоль
 		return
 	}
 
@@ -99,16 +164,13 @@ func runDiscoveryMode() {
 	log.Printf("Найдено %d устройств. Начинаю сбор информации...", len(configs))
 	polledDevices := processDevices(configs)
 
-	// Если были успешно опрошены какие-либо устройства, сохраняем их конфигурацию
 	if len(polledDevices) > 0 {
 		saveConfiguration(polledDevices)
 	}
 }
-// processDevices - основная функция, реализующая "умную" логику обновления и создания файлов.
-// Теперь она возвращает срез успешно опрошенных устройств.
+
 func processDevices(configs []shtrih.Config) []PolledDevice {
-	// Шаг 1: Сначала собираем информацию со всех найденных устройств.
-	var polledDevices []PolledDevice // Было: var freshKKTData []*shtrih.FiscalInfo
+	var polledDevices []PolledDevice
 	for _, config := range configs {
 		log.Printf("--- Опрашиваю устройство: %+v ---", config)
 		driver := shtrih.New(config)
@@ -119,7 +181,7 @@ func processDevices(configs []shtrih.Config) []PolledDevice {
 		}
 
 		info, err := driver.GetFiscalInfo()
-		driver.Disconnect() // Отключаемся сразу после получения данных
+		driver.Disconnect()
 
 		if err != nil {
 			log.Printf("Ошибка при получении фискальной информации: %v", err)
@@ -129,30 +191,26 @@ func processDevices(configs []shtrih.Config) []PolledDevice {
 			log.Println("Получена пустая информация или отсутствует серийный номер, данные проигнорированы.")
 			continue
 		}
-		// Сохраняем и конфигурацию, и результат
 		polledDevices = append(polledDevices, PolledDevice{Config: config, Info: info})
 	}
 
 	if len(polledDevices) == 0 {
 		log.Println("--- Не удалось собрать данные ни с одного устройства. Завершение. ---")
-		return nil // Возвращаем nil, если ничего не найдено
+		return nil
 	}
 
 	log.Printf("--- Всего собрано данных с %d устройств. Начинаю обработку файлов. ---", len(polledDevices))
 
-	// Шаг 2: Ищем "донора" данных о рабочей станции в папке /date.
 	sourceWSDataMap := findSourceWorkstationData()
 
-	// Шаг 3: Обрабатываем каждого "свежего" ККТ в соответствии с новой логикой.
 	var successCount int
-	for _, pd := range polledDevices { // Итерируемся по новой структуре
-		kktInfo := pd.Info // Получаем доступ к данным ККТ
+	for _, pd := range polledDevices {
+		kktInfo := pd.Info
 		fileName := fmt.Sprintf("%s.json", kktInfo.SerialNumber)
 		filePath := filepath.Join(outputDir, fileName)
 
-		// ... (остальная часть цикла остается без изменений) ...
 		if _, err := os.Stat(filePath); err == nil {
-			log.Printf("Файл для ККТ %s уже существует. Обновляю временную метку...", kktInfo.SerialNumber)
+			log.Printf("Файл для ККТ %s уже существует. Обновляю временные метки...", kktInfo.SerialNumber)
 			if err := updateTimestampInFile(filePath); err != nil {
 				log.Printf("Не удалось обновить файл %s: %v", filePath, err)
 			} else {
@@ -169,7 +227,7 @@ func processDevices(configs []shtrih.Config) []PolledDevice {
 				hostname, _ := os.Hostname()
 				wsDataToUse = map[string]interface{}{"hostname": hostname}
 			}
-			wsDataToUse["current_time"] = time.Now().Format("2006-01-02 15:04:05")
+
 			if err := saveNewMergedInfo(kktInfo, wsDataToUse, filePath); err != nil {
 				log.Printf("Не удалось создать файл для ККТ %s: %v", kktInfo.SerialNumber, err)
 			} else {
@@ -179,10 +237,11 @@ func processDevices(configs []shtrih.Config) []PolledDevice {
 	}
 	log.Printf("--- Обработка файлов завершена. Успешно создано/обновлено: %d файлов. ---", successCount)
 
-	return polledDevices // Возвращаем результат
+	return polledDevices
 }
-// findSourceWorkstationData ищет в папке /date любой .json файл и извлекает из него
-// все данные как `map[string]interface{}`.
+
+// --- ФУНКЦИИ ДЛЯ РАБОТЫ С ФАЙЛАМИ ---
+
 func findSourceWorkstationData() map[string]interface{} {
 	files, err := os.ReadDir(outputDir)
 	if err != nil {
@@ -204,13 +263,11 @@ func findSourceWorkstationData() map[string]interface{} {
 				continue
 			}
 
-			// Проверяем, что это не файл от нашего ККТ (у него не должно быть поля modelName)
-			// и что у него есть hostname. Это делает выбор донора более надежным.
 			_, hasModelName := content["modelName"]
 			_, hasHostname := content["hostname"]
 			if !hasModelName && hasHostname {
 				log.Printf("Найден файл-донор с данными о рабочей станции: %s", filePath)
-				return content // Возвращаем все содержимое файла как карту.
+				return content
 			}
 		}
 	}
@@ -219,7 +276,6 @@ func findSourceWorkstationData() map[string]interface{} {
 	return nil
 }
 
-// updateTimestampInFile читает JSON-файл, обновляет в нем поле current_time и перезаписывает его.
 func updateTimestampInFile(filePath string) error {
 	data, err := os.ReadFile(filePath)
 	if err != nil {
@@ -231,7 +287,10 @@ func updateTimestampInFile(filePath string) error {
 		return fmt.Errorf("ошибка парсинга JSON: %w", err)
 	}
 
-	content["current_time"] = time.Now().Format("2006-01-02 15:04:05")
+	// Обновляем оба поля времени
+	currentTime := time.Now().Format("2006-01-02 15:04:05")
+	content["current_time"] = currentTime
+	content["v_time"] = currentTime
 
 	updatedData, err := json.MarshalIndent(content, "", "    ")
 	if err != nil {
@@ -241,22 +300,21 @@ func updateTimestampInFile(filePath string) error {
 	return os.WriteFile(filePath, updatedData, 0644)
 }
 
-// saveNewMergedInfo объединяет данные ККТ и данные рабочей станции (в виде map) и сохраняет в новый JSON-файл.
 func saveNewMergedInfo(kktInfo *shtrih.FiscalInfo, wsData map[string]interface{}, filePath string) error {
 	var kktMap map[string]interface{}
 	kktJSON, _ := json.Marshal(kktInfo)
 	json.Unmarshal(kktJSON, &kktMap)
 
-	// Сливаем карты. Ключи из wsData перезапишут любые совпадения в kktMap.
+	// Добавляем актуальные временные метки в данные рабочей станции
+	currentTime := time.Now().Format("2006-01-02 15:04:05")
+	wsData["current_time"] = currentTime
+	wsData["v_time"] = currentTime
+
 	for key, value := range wsData {
 		kktMap[key] = value
 	}
-	
-	// Удаляем поля, специфичные для ККТ, из данных донора, если они случайно туда попали.
-	// Это предотвратит запись, например, "serialNumber" от АТОЛ в файл Штриха.
-	delete(kktMap, "serialNumber")
 
-	// Возвращаем серийный номер нашего ККТ, который мы сохранили в структуре kktInfo.
+	delete(kktMap, "serialNumber")
 	kktMap["serialNumber"] = kktInfo.SerialNumber
 
 	if err := os.MkdirAll(filepath.Dir(filePath), 0755); err != nil {
@@ -276,20 +334,50 @@ func saveNewMergedInfo(kktInfo *shtrih.FiscalInfo, wsData map[string]interface{}
 	return nil
 }
 
-// convertSettingsToConfigs преобразует настройки из файла в формат, понятный библиотеке.
+func saveConfiguration(polledDevices []PolledDevice) {
+	log.Printf("Сохранение %d найденных конфигураций в файл '%s'...", len(polledDevices), configFileName)
+	var configFile ConfigFile
+	data, err := os.ReadFile(configFileName)
+	if err == nil {
+		if err := json.Unmarshal(data, &configFile); err != nil {
+			log.Printf("Предупреждение: файл '%s' поврежден (%v). Он будет перезаписан.", configFileName, err)
+			configFile = ConfigFile{}
+		}
+	}
+
+	var newShtrihSettings []ConnectionSettings
+	for _, pd := range polledDevices {
+		newShtrihSettings = append(newShtrihSettings, convertConfigToSettings(pd.Config))
+	}
+
+	configFile.Shtrih = newShtrihSettings
+
+	updatedData, err := json.MarshalIndent(configFile, "", "    ")
+	if err != nil {
+		log.Printf("Ошибка: не удалось преобразовать конфигурацию в JSON: %v", err)
+		return
+	}
+
+	if err := os.WriteFile(configFileName, updatedData, 0644); err != nil {
+		log.Printf("Ошибка: не удалось записать конфигурацию в файл '%s': %v", configFileName, err)
+		return
+	}
+
+	log.Printf("Конфигурация успешно сохранена в '%s'.", configFileName)
+}
+
+// --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+
 func convertSettingsToConfigs(settings []ConnectionSettings) []shtrih.Config {
 	var configs []shtrih.Config
 	baudRateMap := map[string]int32{
-		"115200": 6, "57600": 5, "38400": 4, "19200": 3, "9600": 2,
+		"115200": 6, "57600": 5, "38400": 4, "19200": 3, "9600": 2, "4800": 1,
 	}
 
 	for _, s := range settings {
-		config := shtrih.Config{
-			ConnectionType: s.TypeConnect,
-			Password:       30,
-		}
+		config := shtrih.Config{ConnectionType: s.TypeConnect, Password: 30}
 		switch s.TypeConnect {
-		case 0: // COM-порт
+		case 0:
 			comNum, err := strconv.Atoi(s.ComPort[3:])
 			if err != nil {
 				log.Printf("Некорректное имя COM-порта '%s' в конфигурации, пропуск.", s.ComPort)
@@ -303,7 +391,7 @@ func convertSettingsToConfigs(settings []ConnectionSettings) []shtrih.Config {
 			config.ComName = s.ComPort
 			config.ComNumber = int32(comNum)
 			config.BaudRate = baudRate
-		case 6: // TCP/IP
+		case 6:
 			port, err := strconv.Atoi(s.IPPort)
 			if err != nil {
 				log.Printf("Некорректный TCP-порт '%s' для IP '%s', пропуск.", s.IPPort, s.IP)
@@ -320,63 +408,18 @@ func convertSettingsToConfigs(settings []ConnectionSettings) []shtrih.Config {
 	return configs
 }
 
-// saveConfiguration обновляет файл connect.json, записывая в него
-// конфигурации успешно найденных и опрошенных устройств.
-func saveConfiguration(polledDevices []PolledDevice) {
-	log.Printf("Сохранение %d найденных конфигураций в файл '%s'...", len(polledDevices), configFileName)
-
-	// Шаг 1: Читаем существующий файл или создаем новую структуру.
-	var configFile ConfigFile
-	data, err := os.ReadFile(configFileName)
-	if err == nil {
-		// Файл есть, парсим его, чтобы не потерять другие секции (например, "atol")
-		if err := json.Unmarshal(data, &configFile); err != nil {
-			log.Printf("Предупреждение: файл '%s' поврежден (%v). Он будет перезаписан.", configFileName, err)
-			configFile = ConfigFile{} // Создаем пустую структуру в случае ошибки
-		}
-	}
-
-	// Шаг 2: Формируем новый срез настроек для "shtrih".
-	var newShtrihSettings []ConnectionSettings
-	for _, pd := range polledDevices {
-		newShtrihSettings = append(newShtrihSettings, convertConfigToSettings(pd.Config))
-	}
-
-	// Шаг 3: Полностью заменяем секцию "shtrih" новыми данными.
-	configFile.Shtrih = newShtrihSettings
-
-	// Шаг 4: Записываем обновленную структуру обратно в файл.
-	updatedData, err := json.MarshalIndent(configFile, "", "    ")
-	if err != nil {
-		log.Printf("Ошибка: не удалось преобразовать конфигурацию в JSON: %v", err)
-		return
-	}
-
-	if err := os.WriteFile(configFileName, updatedData, 0644); err != nil {
-		log.Printf("Ошибка: не удалось записать конфигурацию в файл '%s': %v", configFileName, err)
-		return
-	}
-
-	log.Printf("Конфигурация успешно сохранена в '%s'.", configFileName)
-}
-
-// convertConfigToSettings преобразует внутренний формат shtrih.Config
-// в формат ConnectionSettings для записи в connect.json.
 func convertConfigToSettings(config shtrih.Config) ConnectionSettings {
-	// Карта для обратного преобразования индекса скорости в строку
 	baudRateReverseMap := map[int32]string{
-		6: "115200", 5: "57600", 4: "38400", 3: "19200", 2: "9600",
+		6: "115200", 5: "57600", 4: "38400", 3: "19200", 2: "9600", 1: "4800",
 	}
 
-	settings := ConnectionSettings{
-		TypeConnect: config.ConnectionType,
-	}
+	settings := ConnectionSettings{TypeConnect: config.ConnectionType}
 
 	switch config.ConnectionType {
-	case 0: // COM-порт
+	case 0:
 		settings.ComPort = config.ComName
 		settings.ComBaudrate = baudRateReverseMap[config.BaudRate]
-	case 6: // TCP/IP
+	case 6:
 		settings.IP = config.IPAddress
 		settings.IPPort = strconv.Itoa(int(config.TCPPort))
 	}
