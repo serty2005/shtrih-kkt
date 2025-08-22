@@ -2,7 +2,9 @@
 package shtrih
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
 	"reflect"
 	"testing"
 )
@@ -125,5 +127,52 @@ func TestMockDriver_GetInfoError(t *testing.T) {
 	}
 	if info != nil {
 		t.Error("GetFiscalInfo() вернул данные вместе с ошибкой, хотя должен был вернуть nil.")
+	}
+}
+
+// loadMockDataFromFile читает "канонический" JSON-файл и преобразует его
+// в структуру FiscalInfo для использования в мок-драйвере.
+func loadMockDataFromFile(filePath string) (*FiscalInfo, error) {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("не удалось прочитать файл с мок-данными '%s': %w", filePath, err)
+	}
+
+	var info FiscalInfo
+	if err := json.Unmarshal(data, &info); err != nil {
+		return nil, fmt.Errorf("не удалось распарсить JSON из файла '%s': %w", filePath, err)
+	}
+
+	return &info, nil
+}
+
+// TestMockDriver_WithDataFromFile проверяет полный цикл работы мок-драйвера,
+// используя для этого данные, загруженные из реального JSON-файла.
+func TestMockDriver_WithDataFromFile(t *testing.T) {
+	// Arrange 1: Загружаем данные из нашего "золотого" файла.
+	// Путь указывается относительно корня пакета.
+	canonicalData, err := loadMockDataFromFile("testdata/canonical_kkt_data.json")
+	if err != nil {
+		// Если файл не найден или поврежден, тест должен провалиться.
+		t.Fatalf("Подготовка теста провалилась: не удалось загрузить мок-данные: %v", err)
+	}
+
+	// Arrange 2: Создаем мок-драйвер, передавая ему загруженные данные.
+	driver := NewMockDriver(canonicalData, nil, nil)
+
+	// Act
+	if err := driver.Connect(); err != nil {
+		t.Fatalf("Connect() вернул неожиданную ошибку: %v", err)
+	}
+	defer driver.Disconnect()
+
+	info, err := driver.GetFiscalInfo()
+	if err != nil {
+		t.Fatalf("GetFiscalInfo() вернул неожиданную ошибку: %v", err)
+	}
+
+	// Assert: Сверяем, что драйвер вернул в точности те данные, что были в файле.
+	if !reflect.DeepEqual(info, canonicalData) {
+		t.Errorf("Данные, возвращенные мок-драйвером, не совпадают с данными из файла.\nПолучено: %+v\nОжидалось: %+v", info, canonicalData)
 	}
 }

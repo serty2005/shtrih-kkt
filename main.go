@@ -18,22 +18,22 @@ import (
 const (
 	configFileName    = "connect.json"
 	serviceConfigName = "service.json"
-	outputDir         = "date"
 	logsDir           = "logs"
-	comSearchTimeout  = 200 * time.Millisecond // Уменьшенный таймаут
-	tcpSearchTimeout  = 150 * time.Millisecond
+	comSearchTimeout  = 200 * time.Millisecond
+	tcpSearchTimeout  = 200 * time.Millisecond
 )
+
+// Глобальная переменная для пути вывода. Это позволяет подменять ее в тестах.
+var outputDir = "date"
 
 // --- СТРУКТУРЫ ДЛЯ ПАРСИНГА КОНФИГУРАЦИОННЫХ ФАЙЛОВ ---
 
-// ConfigFile соответствует структуре файла connect.json
 type ConfigFile struct {
 	Timeout int                  `json:"timeout_to_ip_port"`
 	Shtrih  []ConnectionSettings `json:"shtrih"`
 	Atol    []interface{}        `json:"atol"`
 }
 
-// ConnectionSettings описывает один блок настроек подключения для Штрих-М
 type ConnectionSettings struct {
 	TypeConnect int32  `json:"type_connect"`
 	ComPort     string `json:"com_port"`
@@ -42,19 +42,15 @@ type ConnectionSettings struct {
 	IPPort      string `json:"ip_port"`
 }
 
-// ServiceFile используется для чтения настроек логирования из service.json
 type ServiceFile struct {
 	Service ServiceConfig `json:"service"`
 }
 
-// ServiceConfig содержит параметры логирования
 type ServiceConfig struct {
 	LogLevel string `json:"log_level"`
 	LogDays  int    `json:"log_days"`
 }
 
-// PolledDevice связывает конфигурацию, использованную для подключения,
-// с фискальной информацией, полученной от устройства.
 type PolledDevice struct {
 	Config shtrih.Config
 	Info   *shtrih.FiscalInfo
@@ -81,7 +77,6 @@ func main() {
 	log.Println("Работа приложения завершена.")
 }
 
-// setupLogger настраивает запись логов в файл для стационарного режима.
 func setupLogger() {
 	data, err := os.ReadFile(serviceConfigName)
 	if err != nil {
@@ -95,13 +90,11 @@ func setupLogger() {
 		return
 	}
 
-	// Устанавливаем значения по умолчанию, если в файле их нет
 	logDays := serviceFile.Service.LogDays
 	if logDays <= 0 {
 		logDays = 7
 	}
 
-	// Создаем папку для логов, если ее нет
 	if err := os.MkdirAll(logsDir, 0755); err != nil {
 		log.Printf("Ошибка создания директории для логов '%s': %v. Логирование продолжится в консоль.", logsDir, err)
 		return
@@ -109,28 +102,25 @@ func setupLogger() {
 
 	logFilePath := filepath.Join(logsDir, "shtrih-scanner.log")
 
-	// Настраиваем ротацию логов
 	lumberjackLogger := &lumberjack.Logger{
 		Filename:   logFilePath,
-		MaxSize:    5, // мегабайты
+		MaxSize:    5,
 		MaxBackups: 10,
-		MaxAge:     logDays, // дни
-		Compress:   true,    // сжимать старые файлы
+		MaxAge:     logDays,
+		Compress:   true,
 	}
 
-	// Устанавливаем вывод логов и в файл, и в консоль
 	log.SetOutput(io.MultiWriter(os.Stdout, lumberjackLogger))
 	log.Printf("Логирование настроено. Уровень: %s, ротация: %d дней. Файл: %s", serviceFile.Service.LogLevel, logDays, logFilePath)
 }
 
 func runConfigMode(data []byte) {
-	// Первым делом настраиваем логирование для стационарного режима!
 	setupLogger()
 
 	var configFile ConfigFile
 	if err := json.Unmarshal(data, &configFile); err != nil {
 		log.Printf("Ошибка парсинга JSON из '%s': %v. Переключаюсь на режим автопоиска.", configFileName, err)
-		runDiscoveryMode() // В случае ошибки автопоиск будет логировать только в консоль
+		runDiscoveryMode()
 		return
 	}
 
@@ -147,7 +137,8 @@ func runConfigMode(data []byte) {
 		return
 	}
 
-	processDevices(configs)
+	// Передаем конструктор реального драйвера shtrih.New
+	processDevices(configs, shtrih.New)
 }
 
 func runDiscoveryMode() {
@@ -162,18 +153,22 @@ func runDiscoveryMode() {
 	}
 
 	log.Printf("Найдено %d устройств. Начинаю сбор информации...", len(configs))
-	polledDevices := processDevices(configs)
+	// Передаем конструктор реального драйвера shtrih.New
+	polledDevices := processDevices(configs, shtrih.New)
 
 	if len(polledDevices) > 0 {
 		saveConfiguration(polledDevices)
 	}
 }
 
-func processDevices(configs []shtrih.Config) []PolledDevice {
+// processDevices принимает функцию-фабрику `newDriverFunc` для создания драйвера.
+// Это позволяет подменять реальный драйвер на мок-драйвер в тестах.
+func processDevices(configs []shtrih.Config, newDriverFunc func(shtrih.Config) shtrih.Driver) []PolledDevice {
 	var polledDevices []PolledDevice
 	for _, config := range configs {
 		log.Printf("--- Опрашиваю устройство: %+v ---", config)
-		driver := shtrih.New(config)
+		// Используем переданную функцию-фабрику для создания драйвера
+		driver := newDriverFunc(config)
 
 		if err := driver.Connect(); err != nil {
 			log.Printf("Не удалось подключиться к устройству: %v", err)
@@ -242,36 +237,67 @@ func processDevices(configs []shtrih.Config) []PolledDevice {
 
 // --- ФУНКЦИИ ДЛЯ РАБОТЫ С ФАЙЛАМИ ---
 
+// findSourceWorkstationData ищет в папке /date файл с данными о рабочей станции.
+// Логика поиска:
+// 1. Ищет "идеальный" донор: файл с "hostname", но без "modelName". Если находит - сразу возвращает его.
+// 2. Если идеальный не найден, ищет "первый подходящий": любой файл с "hostname", даже если там есть "modelName".
 func findSourceWorkstationData() map[string]interface{} {
 	files, err := os.ReadDir(outputDir)
 	if err != nil {
 		return nil
 	}
 
+	var firstCandidate map[string]interface{} // Переменная для хранения "первого подходящего" кандидата
+
 	for _, file := range files {
-		if !file.IsDir() && filepath.Ext(file.Name()) == ".json" {
-			filePath := filepath.Join(outputDir, file.Name())
-			data, err := os.ReadFile(filePath)
-			if err != nil {
-				log.Printf("Предупреждение: не удалось прочитать файл-донор %s: %v", filePath, err)
-				continue
-			}
+		if file.IsDir() || filepath.Ext(file.Name()) != ".json" {
+			continue
+		}
 
-			var content map[string]interface{}
-			if err := json.Unmarshal(data, &content); err != nil {
-				log.Printf("Предупреждение: не удалось распарсить JSON из файла-донора %s: %v", filePath, err)
-				continue
-			}
+		filePath := filepath.Join(outputDir, file.Name())
+		data, err := os.ReadFile(filePath)
+		if err != nil {
+			log.Printf("Предупреждение: не удалось прочитать файл-донор %s: %v", filePath, err)
+			continue
+		}
 
-			_, hasModelName := content["modelName"]
-			_, hasHostname := content["hostname"]
-			if !hasModelName && hasHostname {
-				log.Printf("Найден файл-донор с данными о рабочей станции: %s", filePath)
-				return content
-			}
+		var content map[string]interface{}
+		if err := json.Unmarshal(data, &content); err != nil {
+			log.Printf("Предупреждение: не удалось распарсить JSON из файла-донора %s: %v", filePath, err)
+			continue
+		}
+
+		// Проверяем наличие ключевых полей
+		_, hasModelName := content["modelName"]
+		_, hasHostname := content["hostname"]
+
+		// Если у файла нет hostname, он нам точно не интересен
+		if !hasHostname {
+			continue
+		}
+
+		// Сценарий 1: Найден "идеальный" донор (без modelName)
+		if !hasModelName {
+			log.Printf("Найден идеальный файл-донор с данными о рабочей станции: %s", filePath)
+			return content // Сразу возвращаем его
+		}
+
+		// Сценарий 2: Файл не идеальный, но подходит как кандидат (есть и hostname, и modelName)
+		// Сохраняем только самого первого кандидата из списка файлов.
+		if firstCandidate == nil {
+			firstCandidate = content
+			log.Printf("Найден файл-кандидат на роль донора (будет использован, если не найдется идеальный): %s", filePath)
 		}
 	}
 
+	// После проверки всех файлов, если мы так и не вернули идеального донора,
+	// используем первого подходящего кандидата, которого нашли.
+	if firstCandidate != nil {
+		log.Println("Идеальный донор не найден, используется первый подходящий файл-кандидат.")
+		return firstCandidate
+	}
+
+	// Если мы дошли до сюда, значит не было найдено ни одного файла с полем "hostname".
 	log.Println("В папке /date не найдено файлов-доноров. Будут использованы базовые данные.")
 	return nil
 }
@@ -281,47 +307,57 @@ func updateTimestampInFile(filePath string) error {
 	if err != nil {
 		return fmt.Errorf("ошибка чтения файла: %w", err)
 	}
-
 	var content map[string]interface{}
 	if err := json.Unmarshal(data, &content); err != nil {
 		return fmt.Errorf("ошибка парсинга JSON: %w", err)
 	}
-
-	// Обновляем оба поля времени
 	currentTime := time.Now().Format("2006-01-02 15:04:05")
 	content["current_time"] = currentTime
 	content["v_time"] = currentTime
-
 	updatedData, err := json.MarshalIndent(content, "", "    ")
 	if err != nil {
 		return fmt.Errorf("ошибка маршалинга JSON: %w", err)
 	}
-
 	return os.WriteFile(filePath, updatedData, 0644)
 }
 
+// saveNewMergedInfo объединяет данные ККТ и данные рабочей станции (в виде map) и сохраняет в новый JSON-файл.
+// Данные от ККТ имеют приоритет и перезаписывают одноименные поля из данных донора.
 func saveNewMergedInfo(kktInfo *shtrih.FiscalInfo, wsData map[string]interface{}, filePath string) error {
+	// Шаг 1: Преобразуем данные от нашего ККТ (Штрих) в map.
 	var kktMap map[string]interface{}
 	kktJSON, _ := json.Marshal(kktInfo)
 	json.Unmarshal(kktJSON, &kktMap)
 
-	// Добавляем актуальные временные метки в данные рабочей станции
-	currentTime := time.Now().Format("2006-01-02 15:04:05")
-	wsData["current_time"] = currentTime
-	wsData["v_time"] = currentTime
-
+	// Шаг 2: Создаем итоговую карту. Начинаем с данных донора, чтобы они были "внизу".
+	// Мы делаем копию wsData, чтобы не изменять оригинальную карту, которая может быть использована в других итерациях.
+	finalMap := make(map[string]interface{})
 	for key, value := range wsData {
-		kktMap[key] = value
+		finalMap[key] = value
 	}
 
-	delete(kktMap, "serialNumber")
-	kktMap["serialNumber"] = kktInfo.SerialNumber
+	// Шаг 3: "Накладываем" данные от нашего ККТ поверх.
+	// Все совпадающие ключи будут перезаписаны значениями от Штриха.
+	for key, value := range kktMap {
+		// Пропускаем пустые значения от ККТ, чтобы случайно не затереть
+		// хорошее значение из донора пустым.
+		if s, ok := value.(string); ok && s == "" {
+			continue
+		}
+		finalMap[key] = value
+	}
 
+	// Шаг 4: Устанавливаем актуальные временные метки. Они всегда должны быть свежими.
+	currentTime := time.Now().Format("2006-01-02 15:04:05")
+	finalMap["current_time"] = currentTime
+	finalMap["v_time"] = currentTime
+
+	// Шаг 5: Создаем директорию и сохраняем файл.
 	if err := os.MkdirAll(filepath.Dir(filePath), 0755); err != nil {
 		return fmt.Errorf("не удалось создать директорию '%s': %w", outputDir, err)
 	}
 
-	finalJSON, err := json.MarshalIndent(kktMap, "", "    ")
+	finalJSON, err := json.MarshalIndent(finalMap, "", "    ")
 	if err != nil {
 		return fmt.Errorf("ошибка маршалинга итогового JSON: %w", err)
 	}
@@ -344,25 +380,20 @@ func saveConfiguration(polledDevices []PolledDevice) {
 			configFile = ConfigFile{}
 		}
 	}
-
 	var newShtrihSettings []ConnectionSettings
 	for _, pd := range polledDevices {
 		newShtrihSettings = append(newShtrihSettings, convertConfigToSettings(pd.Config))
 	}
-
 	configFile.Shtrih = newShtrihSettings
-
 	updatedData, err := json.MarshalIndent(configFile, "", "    ")
 	if err != nil {
 		log.Printf("Ошибка: не удалось преобразовать конфигурацию в JSON: %v", err)
 		return
 	}
-
 	if err := os.WriteFile(configFileName, updatedData, 0644); err != nil {
 		log.Printf("Ошибка: не удалось записать конфигурацию в файл '%s': %v", configFileName, err)
 		return
 	}
-
 	log.Printf("Конфигурация успешно сохранена в '%s'.", configFileName)
 }
 
@@ -373,7 +404,6 @@ func convertSettingsToConfigs(settings []ConnectionSettings) []shtrih.Config {
 	baudRateMap := map[string]int32{
 		"115200": 6, "57600": 5, "38400": 4, "19200": 3, "9600": 2, "4800": 1,
 	}
-
 	for _, s := range settings {
 		config := shtrih.Config{ConnectionType: s.TypeConnect, Password: 30}
 		switch s.TypeConnect {
@@ -412,9 +442,7 @@ func convertConfigToSettings(config shtrih.Config) ConnectionSettings {
 	baudRateReverseMap := map[int32]string{
 		6: "115200", 5: "57600", 4: "38400", 3: "19200", 2: "9600", 1: "4800",
 	}
-
 	settings := ConnectionSettings{TypeConnect: config.ConnectionType}
-
 	switch config.ConnectionType {
 	case 0:
 		settings.ComPort = config.ComName
