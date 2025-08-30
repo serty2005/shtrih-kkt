@@ -7,7 +7,9 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"shtrih-kkt/pkg/shtrih"
@@ -24,7 +26,10 @@ const (
 )
 
 // Глобальная переменная для пути вывода. Это позволяет подменять ее в тестах.
-var outputDir = "date"
+var (
+	outputDir = "date"
+	version   = "0.1.4-dev"
+)
 
 // --- СТРУКТУРЫ ДЛЯ ПАРСИНГА КОНФИГУРАЦИОННЫХ ФАЙЛОВ ---
 
@@ -47,8 +52,9 @@ type ServiceFile struct {
 }
 
 type ServiceConfig struct {
-	LogLevel string `json:"log_level"`
-	LogDays  int    `json:"log_days"`
+	LogLevel  string `json:"log_level"`
+	LogDays   int    `json:"log_days"`
+	UpdateURL string `json:"update_url"`
 }
 
 type PolledDevice struct {
@@ -59,8 +65,20 @@ type PolledDevice struct {
 // --- ОСНОВНАЯ ЛОГИКА ПРИЛОЖЕНИЯ ---
 
 func main() {
-	log.Println("Запуск приложения для сбора данных с ККТ Штрих-М...")
+	log.Printf("Запуск приложения для сбора данных с ККТ Штрих-М, версия: %s", version)
 
+	// Загружаем сервисную конфигурацию в самом начале.
+	serviceConfig := loadServiceConfig()
+
+	// Настраиваем файловое логирование.
+	setupLogger(serviceConfig)
+
+	// В фоне запускаем проверку обновлений, если URL указан.
+	if serviceConfig != nil {
+		go checkForUpdates(version, serviceConfig.UpdateURL)
+	}
+
+	// Основная логика приложения.
 	configData, err := os.ReadFile(configFileName)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -77,22 +95,34 @@ func main() {
 	log.Println("Работа приложения завершена.")
 }
 
-func setupLogger() {
+// loadServiceConfig читает и парсит service.json.
+// Возвращает конфигурацию или nil, если файл не найден или поврежден.
+func loadServiceConfig() *ServiceConfig {
 	data, err := os.ReadFile(serviceConfigName)
 	if err != nil {
-		log.Printf("Предупреждение: файл настроек '%s' не найден. Логирование продолжится в консоль.", serviceConfigName)
-		return
+		if !os.IsNotExist(err) {
+			log.Printf("Предупреждение: ошибка чтения файла '%s': %v.", serviceConfigName, err)
+		}
+		return nil
 	}
 
 	var serviceFile ServiceFile
 	if err := json.Unmarshal(data, &serviceFile); err != nil {
-		log.Printf("Предупреждение: не удалось прочитать настройки из '%s' (%v). Логирование продолжится в консоль.", serviceConfigName, err)
+		log.Printf("Предупреждение: не удалось прочитать настройки из '%s' (%v).", serviceConfigName, err)
+		return nil
+	}
+	return &serviceFile.Service
+}
+
+func setupLogger(config *ServiceConfig) {
+	if config == nil {
+		log.Printf("Предупреждение: файл настроек '%s' не найден или некорректен. Логирование продолжится в консоль.", serviceConfigName)
 		return
 	}
 
-	logDays := serviceFile.Service.LogDays
+	logDays := config.LogDays
 	if logDays <= 0 {
-		logDays = 7
+		logDays = 7 // Значение по умолчанию
 	}
 
 	if err := os.MkdirAll(logsDir, 0755); err != nil {
@@ -111,11 +141,11 @@ func setupLogger() {
 	}
 
 	log.SetOutput(io.MultiWriter(os.Stdout, lumberjackLogger))
-	log.Printf("Логирование настроено. Уровень: %s, ротация: %d дней. Файл: %s", serviceFile.Service.LogLevel, logDays, logFilePath)
+	log.Printf("Логирование настроено. Уровень: %s, ротация: %d дней. Файл: %s", config.LogLevel, logDays, logFilePath)
 }
 
 func runConfigMode(data []byte) {
-	setupLogger()
+	// setupLogger() // <--- УДАЛИТЕ ЭТУ СТРОКУ
 
 	var configFile ConfigFile
 	if err := json.Unmarshal(data, &configFile); err != nil {
@@ -124,9 +154,17 @@ func runConfigMode(data []byte) {
 		return
 	}
 
-	if len(configFile.Shtrih) == 0 {
-		log.Printf("В файле '%s' не найдено настроек для 'shtrih'. Переключаюсь на режим автопоиска.", configFileName)
+	// Проверяем наличие секции shtrih в файле, но не пустоту массива.
+	// Пустой массив shtrih: [] является валидным состоянием.
+	if configFile.Shtrih == nil {
+		log.Printf("В файле '%s' отсутствует секция 'shtrih'. Переключаюсь на режим автопоиска.", configFileName)
 		runDiscoveryMode()
+		return
+	}
+
+	if len(configFile.Shtrih) == 0 {
+		log.Println("Список устройств 'shtrih' в конфигурации пуст. Сканирование не требуется.")
+		// Здесь можно завершить работу, так как опрашивать нечего.
 		return
 	}
 
@@ -149,7 +187,9 @@ func runDiscoveryMode() {
 
 	if len(configs) == 0 {
 		log.Println("В ходе сканирования не найдено ни одного устройства Штрих-М.")
-		return
+		// Сохраняем информацию об отсутствии устройств, чтобы не сканировать в следующий раз.
+		saveEmptyShtrihConfig()
+		return // Завершаем работу, так как устройств нет.
 	}
 
 	log.Printf("Найдено %d устройств. Начинаю сбор информации...", len(configs))
@@ -198,36 +238,31 @@ func processDevices(configs []shtrih.Config, newDriverFunc func(shtrih.Config) s
 
 	sourceWSDataMap := findSourceWorkstationData()
 
+	cleanupDateDirectory()
+
 	var successCount int
 	for _, pd := range polledDevices {
 		kktInfo := pd.Info
 		fileName := fmt.Sprintf("%s.json", kktInfo.SerialNumber)
 		filePath := filepath.Join(outputDir, fileName)
 
-		if _, err := os.Stat(filePath); err == nil {
-			log.Printf("Файл для ККТ %s уже существует. Обновляю временные метки...", kktInfo.SerialNumber)
-			if err := updateTimestampInFile(filePath); err != nil {
-				log.Printf("Не удалось обновить файл %s: %v", filePath, err)
-			} else {
-				log.Printf("Файл %s успешно обновлен.", filePath)
-				successCount++
-			}
+		// Определяем, какие данные о рабочей станции использовать.
+		var wsDataToUse map[string]interface{}
+		if sourceWSDataMap != nil {
+			log.Printf("Готовлю данные для ККТ %s, используя информацию из файла-донора.", kktInfo.SerialNumber)
+			wsDataToUse = sourceWSDataMap
 		} else {
-			var wsDataToUse map[string]interface{}
-			if sourceWSDataMap != nil {
-				log.Printf("Создаю новый файл для ККТ %s, используя данные о рабочей станции из файла-донора.", kktInfo.SerialNumber)
-				wsDataToUse = sourceWSDataMap
-			} else {
-				log.Printf("Создаю первичный файл для ККТ %s с базовыми данными о рабочей станции.", kktInfo.SerialNumber)
-				hostname, _ := os.Hostname()
-				wsDataToUse = map[string]interface{}{"hostname": hostname}
-			}
+			log.Printf("Готовлю данные для ККТ %s с базовой информацией о рабочей станции (донор не найден).", kktInfo.SerialNumber)
+			hostname, _ := os.Hostname()
+			wsDataToUse = map[string]interface{}{"hostname": hostname}
+		}
 
-			if err := saveNewMergedInfo(kktInfo, wsDataToUse, filePath); err != nil {
-				log.Printf("Не удалось создать файл для ККТ %s: %v", kktInfo.SerialNumber, err)
-			} else {
-				successCount++
-			}
+		// Безусловно сохраняем/перезаписываем файл.
+		if err := saveNewMergedInfo(kktInfo, wsDataToUse, filePath); err != nil {
+			log.Printf("Не удалось создать/перезаписать файл для ККТ %s: %v", kktInfo.SerialNumber, err)
+		} else {
+			// Логика в saveNewMergedInfo уже выводит сообщение об успехе.
+			successCount++
 		}
 	}
 	log.Printf("--- Обработка файлов завершена. Успешно создано/обновлено: %d файлов. ---", successCount)
@@ -302,23 +337,52 @@ func findSourceWorkstationData() map[string]interface{} {
 	return nil
 }
 
-func updateTimestampInFile(filePath string) error {
-	data, err := os.ReadFile(filePath)
+// cleanupDateDirectory сканирует рабочую директорию и удаляет файлы,
+// имя которых (без расширения) содержит нечисловые символы.
+// Это необходимо для очистки временных/донорских файлов перед записью актуальных данных.
+func cleanupDateDirectory() {
+	log.Println("Запуск очистки рабочей директории от временных файлов...")
+
+	files, err := os.ReadDir(outputDir)
 	if err != nil {
-		return fmt.Errorf("ошибка чтения файла: %w", err)
+		// Если директория еще не создана, это не ошибка. Просто выходим.
+		if os.IsNotExist(err) {
+			log.Printf("Директория '%s' не найдена, очистка не требуется.", outputDir)
+			return
+		}
+		log.Printf("Ошибка чтения директории '%s' при очистке: %v", outputDir, err)
+		return
 	}
-	var content map[string]interface{}
-	if err := json.Unmarshal(data, &content); err != nil {
-		return fmt.Errorf("ошибка парсинга JSON: %w", err)
+
+	// Регулярное выражение для проверки, что строка состоит только из цифр.
+	isNumeric := regexp.MustCompile(`^[0-9]+$`).MatchString
+	deletedCount := 0
+
+	for _, file := range files {
+		if file.IsDir() || filepath.Ext(file.Name()) != ".json" {
+			continue
+		}
+
+		// Получаем имя файла без расширения .json
+		baseName := strings.TrimSuffix(file.Name(), filepath.Ext(file.Name()))
+
+		if !isNumeric(baseName) {
+			filePath := filepath.Join(outputDir, file.Name())
+			log.Printf("Обнаружен некорректный файл '%s'. Удаляю...", file.Name())
+			if err := os.Remove(filePath); err != nil {
+				log.Printf("Не удалось удалить файл '%s': %v", filePath, err)
+			} else {
+				log.Printf("Файл '%s' успешно удален.", file.Name())
+				deletedCount++
+			}
+		}
 	}
-	currentTime := time.Now().Format("2006-01-02 15:04:05")
-	content["current_time"] = currentTime
-	content["v_time"] = currentTime
-	updatedData, err := json.MarshalIndent(content, "", "    ")
-	if err != nil {
-		return fmt.Errorf("ошибка маршалинга JSON: %w", err)
+
+	if deletedCount > 0 {
+		log.Printf("Очистка завершена. Удалено %d файлов.", deletedCount)
+	} else {
+		log.Println("Некорректных файлов для удаления не найдено.")
 	}
-	return os.WriteFile(filePath, updatedData, 0644)
 }
 
 // saveNewMergedInfo объединяет данные ККТ и данные рабочей станции (в виде map) и сохраняет в новый JSON-файл.
@@ -368,6 +432,42 @@ func saveNewMergedInfo(kktInfo *shtrih.FiscalInfo, wsData map[string]interface{}
 
 	log.Printf("Данные для ККТ %s успешно сохранены в новый файл: %s", kktInfo.SerialNumber, filePath)
 	return nil
+}
+
+// saveEmptyShtrihConfig создает или обновляет connect.json, указывая,
+// что устройства "Штрих-М" не были найдены. Это предотвращает повторные
+// полные сканирования при последующих запусках.
+func saveEmptyShtrihConfig() {
+	log.Printf("Сохраняю конфигурацию с пустым списком устройств Штрих-М в '%s'...", configFileName)
+	var configFile ConfigFile
+
+	// Пытаемся прочитать существующий файл, чтобы не затереть другие секции (например, 'atol').
+	data, err := os.ReadFile(configFileName)
+	if err == nil {
+		if err := json.Unmarshal(data, &configFile); err != nil {
+			log.Printf("Предупреждение: файл '%s' поврежден (%v). Он будет перезаписан.", configFileName, err)
+			// В случае ошибки парсинга, начинаем с пустой структуры, чтобы исправить файл.
+			configFile = ConfigFile{}
+		}
+	} else if !os.IsNotExist(err) {
+		// Логируем ошибку, если это не "файл не найден".
+		log.Printf("Предупреждение: не удалось прочитать '%s' (%v). Файл будет создан заново.", configFileName, err)
+	}
+
+	// Устанавливаем пустой срез для 'shtrih'.
+	configFile.Shtrih = []ConnectionSettings{}
+
+	// Маршалинг и запись обратно в файл.
+	updatedData, err := json.MarshalIndent(configFile, "", "    ")
+	if err != nil {
+		log.Printf("Ошибка: не удалось преобразовать пустую конфигурацию в JSON: %v", err)
+		return
+	}
+	if err := os.WriteFile(configFileName, updatedData, 0644); err != nil {
+		log.Printf("Ошибка: не удалось записать пустую конфигурацию в файл '%s': %v", configFileName, err)
+		return
+	}
+	log.Printf("Файл '%s' успешно обновлен с отметкой об отсутствии устройств Штрих-М.", configFileName)
 }
 
 func saveConfiguration(polledDevices []PolledDevice) {

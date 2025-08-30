@@ -37,22 +37,22 @@ type Config struct {
 
 // FiscalInfo содержит агрегированную информацию о фискальном регистраторе.
 type FiscalInfo struct {
-	ModelName        string `json:"modelName"`        // Наименование модели ККТ
-	SerialNumber     string `json:"serialNumber"`     // Заводской номер ККТ
-	RNM              string `json:"RNM"`              // Регистрационный номер машины (РНМ)
-	OrganizationName string `json:"organizationName"` // Наименование организации пользователя
-	Inn              string `json:"INN"`              // ИНН пользователя
-	FnSerial         string `json:"fn_serial"`        // Серийный номер фискального накопителя
-	RegistrationDate string `json:"datetime_reg"`     // Дата и время регистрации ККТ
-	FnEndDate        string `json:"dateTime_end"`     // Дата окончания срока действия ФН
-	OfdName          string `json:"ofdName"`          // Наименование ОФД
-	SoftwareDate     string `json:"bootVersion"`      // Версия (дата) прошивки ККТ
-	FfdVersion       string `json:"ffdVersion"`       // Версия ФФД
-	FnExecution      string `json:"fnExecution"`      // Исполнение ФН
-	InstalledDriver  string `json:"installed_driver"` // Версия установленного COM-драйвера
-	AttributeExcise  bool   `json:"attribute_excise"` // Признак торговли подакцизными товарами
-	AttributeMarked  bool   `json:"attribute_marked"` // Признак торговли маркированными товарами
-	LicensesRawHex   string `json:"licenses,omitempty"` // Строка с лицензиями в HEX-формате
+	ModelName        string `json:"modelName"`          // Наименование модели ККТ
+	SerialNumber     string `json:"serialNumber"`       // Заводской номер ККТ
+	RNM              string `json:"RNM"`                // Регистрационный номер машины (РНМ)
+	OrganizationName string `json:"organizationName"`   // Наименование организации пользователя
+	Inn              string `json:"INN"`                // ИНН пользователя
+	FnSerial         string `json:"fn_serial"`          // Серийный номер фискального накопителя
+	RegistrationDate string `json:"datetime_reg"`       // Дата и время регистрации ККТ
+	FnEndDate        string `json:"dateTime_end"`       // Дата окончания срока действия ФН
+	OfdName          string `json:"ofdName"`            // Наименование ОФД
+	SoftwareDate     string `json:"bootVersion"`        // Версия (дата) прошивки ККТ
+	FfdVersion       string `json:"ffdVersion"`         // Версия ФФД
+	FnExecution      string `json:"fnExecution"`        // Исполнение ФН
+	InstalledDriver  string `json:"installed_driver"`   // Версия установленного COM-драйвера
+	AttributeExcise  bool   `json:"attribute_excise"`   // Признак торговли подакцизными товарами
+	AttributeMarked  bool   `json:"attribute_marked"`   // Признак торговли маркированными товарами
+	SubscriptionInfo string `json:"licenses,omitempty"` // Строка с лицензиями в расшифрованном виде
 }
 
 // Driver определяет основной интерфейс для работы с ККТ.
@@ -114,10 +114,11 @@ func (d *comDriver) Connect() error {
 	// Установка свойств подключения в зависимости от типа.
 	oleutil.PutProperty(d.dispatch, "ConnectionType", d.config.ConnectionType)
 	oleutil.PutProperty(d.dispatch, "Password", d.config.Password)
-	if d.config.ConnectionType == 0 { // COM-порт
+	switch d.config.ConnectionType {
+	case 0: // COM-порт
 		oleutil.PutProperty(d.dispatch, "ComNumber", d.config.ComNumber)
 		oleutil.PutProperty(d.dispatch, "BaudRate", d.config.BaudRate)
-	} else if d.config.ConnectionType == 6 { // TCP/IP
+	case 6: // TCP/IP
 		oleutil.PutProperty(d.dispatch, "IPAddress", d.config.IPAddress)
 		oleutil.PutProperty(d.dispatch, "TCPPort", d.config.TCPPort)
 		oleutil.PutProperty(d.dispatch, "UseIPAddress", true)
@@ -203,10 +204,19 @@ func (d *comDriver) getBaseDeviceInfo(info *FiscalInfo) error {
 		}
 	}
 
+	// Получаем и расшифровываем информацию о лицензии
 	if _, err := oleutil.CallMethod(d.dispatch, "ReadFeatureLicenses"); err == nil {
 		if errCheck := d.checkError(); errCheck == nil {
-			info.LicensesRawHex, _ = d.getPropertyString("License")
+			hexLicense, _ := d.getPropertyString("License")
+			info.SubscriptionInfo = decodeLicense(hexLicense)
+			if info.SubscriptionInfo != "" {
+				log.Printf("Информация о лицензии успешно расшифрована: %s", info.SubscriptionInfo)
+			} else if hexLicense != "" {
+				log.Printf("Не удалось распознать формат полученной лицензии: %s", hexLicense)
+			}
 		}
+	} else {
+		log.Printf("Предупреждение: команда ReadFeatureLicenses не выполнена, информация о лицензиях недоступна.")
 	}
 	return nil
 }
@@ -238,7 +248,7 @@ func (d *comDriver) getFiscalizationInfo(info *FiscalInfo) error {
 
 	workMode, _ := d.getPropertyInt32("WorkMode")
 	workModeEx, _ := d.getPropertyInt32("WorkModeEx")
-	info.AttributeMarked = (workMode & 0x10) != 0 // Бит 4 - признак торговли маркированными товарами
+	info.AttributeMarked = (workMode & 0x10) != 0   // Бит 4 - признак торговли маркированными товарами
 	info.AttributeExcise = (workModeEx & 0x01) != 0 // Бит 0 - признак торговли подакцизными товарами
 	return nil
 }
