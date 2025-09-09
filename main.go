@@ -28,15 +28,17 @@ const (
 // Глобальная переменная для пути вывода. Это позволяет подменять ее в тестах.
 var (
 	outputDir = "date"
-	version   = "0.1.4-dev"
+	version   = "0.1.5-dev"
 )
 
 // --- СТРУКТУРЫ ДЛЯ ПАРСИНГА КОНФИГУРАЦИОННЫХ ФАЙЛОВ ---
 
+// ConfigFile используется для чтения секции "shtrih" из connect.json.
+// Остальные секции файла игнорируются при чтении, но сохраняются при записи.
 type ConfigFile struct {
-	Timeout int                  `json:"timeout_to_ip_port"`
-	Shtrih  []ConnectionSettings `json:"shtrih"`
-	Atol    []interface{}        `json:"atol"`
+	// Если ключ "shtrih" в JSON отсутствует, это поле будет nil.
+	// Если ключ есть, но массив пуст (shtrih: []), поле будет пустым срезом.
+	Shtrih []ConnectionSettings `json:"shtrih"`
 }
 
 type ConnectionSettings struct {
@@ -435,30 +437,33 @@ func saveNewMergedInfo(kktInfo *shtrih.FiscalInfo, wsData map[string]interface{}
 }
 
 // saveEmptyShtrihConfig создает или обновляет connect.json, указывая,
-// что устройства "Штрих-М" не были найдены. Это предотвращает повторные
-// полные сканирования при последующих запусках.
+// что устройства "Штрих-М" не были найдены. Функция работает неразрушающим
+// образом, сохраняя все остальные данные в файле.
 func saveEmptyShtrihConfig() {
 	log.Printf("Сохраняю конфигурацию с пустым списком устройств Штрих-М в '%s'...", configFileName)
-	var configFile ConfigFile
 
-	// Пытаемся прочитать существующий файл, чтобы не затереть другие секции (например, 'atol').
+	// Используем map[string]interface{} для редактирования JSON.
+	configMap := make(map[string]interface{})
+
+	// Пытаемся прочитать существующий файл, чтобы не затереть другие секции.
 	data, err := os.ReadFile(configFileName)
 	if err == nil {
-		if err := json.Unmarshal(data, &configFile); err != nil {
+		// Если файл есть, парсим его в нашу карту.
+		if err := json.Unmarshal(data, &configMap); err != nil {
 			log.Printf("Предупреждение: файл '%s' поврежден (%v). Он будет перезаписан.", configFileName, err)
-			// В случае ошибки парсинга, начинаем с пустой структуры, чтобы исправить файл.
-			configFile = ConfigFile{}
+			// В случае ошибки парсинга, начинаем с пустой карты, чтобы исправить файл.
+			configMap = make(map[string]interface{})
 		}
 	} else if !os.IsNotExist(err) {
 		// Логируем ошибку, если это не "файл не найден".
 		log.Printf("Предупреждение: не удалось прочитать '%s' (%v). Файл будет создан заново.", configFileName, err)
 	}
 
-	// Устанавливаем пустой срез для 'shtrih'.
-	configFile.Shtrih = []ConnectionSettings{}
+	// Устанавливаем или обновляем только ключ 'shtrih'.
+	configMap["shtrih"] = []ConnectionSettings{}
 
 	// Маршалинг и запись обратно в файл.
-	updatedData, err := json.MarshalIndent(configFile, "", "    ")
+	updatedData, err := json.MarshalIndent(configMap, "", "    ")
 	if err != nil {
 		log.Printf("Ошибка: не удалось преобразовать пустую конфигурацию в JSON: %v", err)
 		return
@@ -472,20 +477,34 @@ func saveEmptyShtrihConfig() {
 
 func saveConfiguration(polledDevices []PolledDevice) {
 	log.Printf("Сохранение %d найденных конфигураций в файл '%s'...", len(polledDevices), configFileName)
-	var configFile ConfigFile
+
+	// Используем map[string]interface{} для неразрушающего редактирования JSON.
+	configMap := make(map[string]interface{})
+
+	// Пытаемся прочитать существующий файл, чтобы не затереть другие секции.
 	data, err := os.ReadFile(configFileName)
 	if err == nil {
-		if err := json.Unmarshal(data, &configFile); err != nil {
+		// Если файл есть, парсим его в нашу карту.
+		if err := json.Unmarshal(data, &configMap); err != nil {
 			log.Printf("Предупреждение: файл '%s' поврежден (%v). Он будет перезаписан.", configFileName, err)
-			configFile = ConfigFile{}
+			// В случае ошибки парсинга, начинаем с пустой карты.
+			configMap = make(map[string]interface{})
 		}
+	} else if !os.IsNotExist(err) {
+		log.Printf("Предупреждение: не удалось прочитать '%s' (%v). Файл будет создан заново.", configFileName, err)
 	}
+
+	// Готовим новый срез с настройками для устройств Штрих-М.
 	var newShtrihSettings []ConnectionSettings
 	for _, pd := range polledDevices {
 		newShtrihSettings = append(newShtrihSettings, convertConfigToSettings(pd.Config))
 	}
-	configFile.Shtrih = newShtrihSettings
-	updatedData, err := json.MarshalIndent(configFile, "", "    ")
+
+	// Обновляем в карте только ключ 'shtrih'. Все остальные ключи остаются нетронутыми.
+	configMap["shtrih"] = newShtrihSettings
+
+	// Маршалинг и запись обратно в файл.
+	updatedData, err := json.MarshalIndent(configMap, "", "    ")
 	if err != nil {
 		log.Printf("Ошибка: не удалось преобразовать конфигурацию в JSON: %v", err)
 		return
