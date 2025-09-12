@@ -45,7 +45,7 @@ Go-библиотека и консольная утилита для взаим
 
 1.  **Добавьте библиотеку в ваш проект:**
     ```bash
-    go get github.com/your-username/shtrih-kkt/pkg/shtrih
+    go get github.com/serty2005/shtrih-kkt/pkg/shtrih
     ```
 
 2.  **Пример использования:**
