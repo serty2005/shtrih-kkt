@@ -1,6 +1,6 @@
 module shtrih-kkt
 
-go 1.23.4
+go 1.17
 
 require (
 	github.com/go-ole/go-ole v1.3.0

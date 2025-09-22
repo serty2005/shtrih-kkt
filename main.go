@@ -117,6 +117,9 @@ func loadServiceConfig() *ServiceConfig {
 }
 
 func setupLogger(config *ServiceConfig) {
+	// setupLogger настраивает систему логирования на основе конфигурации.
+	// Если конфигурация не передана или повреждена, логирование продолжается в консоль.
+	// Создает директорию для логов и настраивает ротацию с использованием lumberjack.
 	if config == nil {
 		log.Printf("Предупреждение: файл настроек '%s' не найден или некорректен. Логирование продолжится в консоль.", serviceConfigName)
 		return
@@ -147,7 +150,9 @@ func setupLogger(config *ServiceConfig) {
 }
 
 func runConfigMode(data []byte) {
-	// setupLogger() // <--- УДАЛИТЕ ЭТУ СТРОКУ
+	// runConfigMode запускает приложение в стационарном режиме с использованием
+	// конфигурации из файла connect.json. Парсит настройки устройств и запускает
+	// процесс опроса ККТ. При ошибках парсинга переключается на режим автопоиска.
 
 	var configFile ConfigFile
 	if err := json.Unmarshal(data, &configFile); err != nil {
@@ -182,6 +187,9 @@ func runConfigMode(data []byte) {
 }
 
 func runDiscoveryMode() {
+	// runDiscoveryMode запускает приложение в режиме автопоиска устройств.
+	// Выполняет сканирование COM-портов и TCP-сетей для обнаружения ККТ Штрих-М.
+	// При обнаружении устройств сохраняет их конфигурацию для последующих запусков.
 	configs, err := shtrih.SearchDevices(comSearchTimeout, tcpSearchTimeout)
 	if err != nil {
 		log.Printf("Во время поиска устройств произошла ошибка: %v", err)
@@ -476,6 +484,9 @@ func saveEmptyShtrihConfig() {
 }
 
 func saveConfiguration(polledDevices []PolledDevice) {
+	// saveConfiguration сохраняет конфигурацию найденных устройств в файл connect.json.
+	// Функция работает неразрушающим образом, сохраняя все остальные секции файла.
+	// Преобразует внутренние структуры shtrih.Config в формат ConnectionSettings для JSON.
 	log.Printf("Сохранение %d найденных конфигураций в файл '%s'...", len(polledDevices), configFileName)
 
 	// Используем map[string]interface{} для неразрушающего редактирования JSON.
@@ -519,6 +530,9 @@ func saveConfiguration(polledDevices []PolledDevice) {
 // --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 
 func convertSettingsToConfigs(settings []ConnectionSettings) []shtrih.Config {
+	// convertSettingsToConfigs преобразует настройки подключения из JSON-формата
+	// в внутренние структуры shtrih.Config. Выполняет валидацию параметров
+	// и пропускает некорректные конфигурации с соответствующим логированием.
 	var configs []shtrih.Config
 	baudRateMap := map[string]int32{
 		"115200": 6, "57600": 5, "38400": 4, "19200": 3, "9600": 2, "4800": 1,

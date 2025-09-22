@@ -41,6 +41,7 @@ type FiscalInfo struct {
 	SerialNumber     string `json:"serialNumber"`       // Заводской номер ККТ
 	RNM              string `json:"RNM"`                // Регистрационный номер машины (РНМ)
 	OrganizationName string `json:"organizationName"`   // Наименование организации пользователя
+	Address          string `json:"address"`            // Адрес установки ККТ
 	Inn              string `json:"INN"`                // ИНН пользователя
 	FnSerial         string `json:"fn_serial"`          // Серийный номер фискального накопителя
 	RegistrationDate string `json:"datetime_reg"`       // Дата и время регистрации ККТ
@@ -298,6 +299,10 @@ func (d *comDriver) getInfoFromTables(info *FiscalInfo) error {
 	ofdName, err := d.readTableField(18, 1, 10)
 	if err == nil {
 		info.OfdName = strings.TrimSpace(ofdName)
+	}
+	address, err := d.readTableField(18, 1, 9)
+	if err == nil {
+		info.Address = strings.TrimSpace(address)
 	}
 
 	// Версия ФФД хранится в виде кода: 2 - "1.05", 4 - "1.2"
