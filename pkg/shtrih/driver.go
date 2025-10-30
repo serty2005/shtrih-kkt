@@ -247,9 +247,8 @@ func (d *comDriver) getFiscalizationInfo(info *FiscalInfo) error {
 		}
 	}
 
-	workMode, _ := d.getPropertyInt32("WorkMode")
 	workModeEx, _ := d.getPropertyInt32("WorkModeEx")
-	info.AttributeMarked = (workMode & 0x10) != 0   // Бит 4 - признак торговли маркированными товарами
+	info.AttributeMarked = (workModeEx & 0x10) != 0 // Бит 4 - признак торговли маркированными товарами
 	info.AttributeExcise = (workModeEx & 0x01) != 0 // Бит 0 - признак торговли подакцизными товарами
 	return nil
 }
