@@ -18,26 +18,23 @@ import (
 )
 
 const (
-	configFileName    = "connect.json"
-	serviceConfigName = "service.json"
-	logsDir           = "logs"
-	comSearchTimeout  = 200 * time.Millisecond
-	tcpSearchTimeout  = 200 * time.Millisecond
+	configFileName     = "connect.json"
+	serviceConfigName  = "service.json"
+	defaultManifestURL = "http://f.serty.top/distr/installer/assets/shtrihscanner/update.json"
+	logsDir            = "logs"
+	comSearchTimeout   = 200 * time.Millisecond
+	tcpSearchTimeout   = 200 * time.Millisecond
 )
 
-// Глобальная переменная для пути вывода. Это позволяет подменять ее в тестах.
 var (
 	outputDir = "date"
-	version   = "0.1.5-dev"
+	version   = "0.1.6"
 )
 
 // --- СТРУКТУРЫ ДЛЯ ПАРСИНГА КОНФИГУРАЦИОННЫХ ФАЙЛОВ ---
+// Структура UpdateInfo удалена отсюда, она теперь в updater.go
 
-// ConfigFile используется для чтения секции "shtrih" из connect.json.
-// Остальные секции файла игнорируются при чтении, но сохраняются при записи.
 type ConfigFile struct {
-	// Если ключ "shtrih" в JSON отсутствует, это поле будет nil.
-	// Если ключ есть, но массив пуст (shtrih: []), поле будет пустым срезом.
 	Shtrih []ConnectionSettings `json:"shtrih"`
 }
 
@@ -53,10 +50,15 @@ type ServiceFile struct {
 	Service ServiceConfig `json:"service"`
 }
 
+type UpdateConfig struct {
+	ManifestURL string `json:"manifest_url"`
+}
+
 type ServiceConfig struct {
-	LogLevel  string `json:"log_level"`
-	LogDays   int    `json:"log_days"`
-	UpdateURL string `json:"update_url"`
+	LogLevel     string       `json:"log_level"`
+	LogDays      int          `json:"log_days"`
+	UpdateURL    string       `json:"update_url,omitempty"`
+	ShtrihUpdate UpdateConfig `json:"shtrih_update"`
 }
 
 type PolledDevice struct {
@@ -67,20 +69,19 @@ type PolledDevice struct {
 // --- ОСНОВНАЯ ЛОГИКА ПРИЛОЖЕНИЯ ---
 
 func main() {
-	log.Printf("Запуск приложения для сбора данных с ККТ Штрих-М, версия: %s", version)
+	log.Printf("Запуск сбора данных по протоколу Штрих, версия: %s", version)
 
-	// Загружаем сервисную конфигурацию в самом начале.
-	serviceConfig := loadServiceConfig()
+	// Запускаем очистку старой версии в фоне. Функция находится в updater.go
+	go cleanupOldVersion()
 
-	// Настраиваем файловое логирование.
+	serviceConfig := loadAndPrepareServiceConfig()
 	setupLogger(serviceConfig)
 
-	// В фоне запускаем проверку обновлений, если URL указан.
-	if serviceConfig != nil {
-		go checkForUpdates(version, serviceConfig.UpdateURL)
+	// В фоне запускаем проверку обновлений. Функция находится в updater.go
+	if serviceConfig != nil && serviceConfig.ShtrihUpdate.ManifestURL != "" {
+		go checkForUpdates(version, serviceConfig.ShtrihUpdate.ManifestURL)
 	}
 
-	// Основная логика приложения.
 	configData, err := os.ReadFile(configFileName)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -98,36 +99,92 @@ func main() {
 }
 
 // loadServiceConfig читает и парсит service.json.
-// Возвращает конфигурацию или nil, если файл не найден или поврежден.
-func loadServiceConfig() *ServiceConfig {
+func loadAndPrepareServiceConfig() *ServiceConfig {
+	// 1. Пытаемся прочитать файл.
 	data, err := os.ReadFile(serviceConfigName)
 	if err != nil {
-		if !os.IsNotExist(err) {
-			log.Printf("Предупреждение: ошибка чтения файла '%s': %v.", serviceConfigName, err)
+		if os.IsNotExist(err) {
+			log.Printf("Файл '%s' не найден. Функции логирования и обновления будут отключены.", serviceConfigName)
+			return nil // Файла нет - ничего не делаем.
 		}
+		log.Fatalf("Критическая ошибка чтения файла '%s': %v.", serviceConfigName, err)
 		return nil
 	}
 
-	var serviceFile ServiceFile
-	if err := json.Unmarshal(data, &serviceFile); err != nil {
-		log.Printf("Предупреждение: не удалось прочитать настройки из '%s' (%v).", serviceConfigName, err)
+	// 2. Разбираем весь файл в универсальную карту, чтобы не потерять структуру.
+	var fileStructure map[string]interface{}
+	if err := json.Unmarshal(data, &fileStructure); err != nil {
+		log.Fatalf("Файл '%s' поврежден (невалидный JSON): %v.", serviceConfigName, err)
 		return nil
 	}
-	return &serviceFile.Service
+
+	// 3. Получаем секцию "service" и проверяем, что это объект.
+	serviceRaw, serviceExists := fileStructure["service"]
+	if !serviceExists {
+		log.Printf("Предупреждение: в '%s' отсутствует секция 'service'. Логирование и обновления не будут настроены.", serviceConfigName)
+		return nil
+	}
+	serviceMap, isMap := serviceRaw.(map[string]interface{})
+	if !isMap {
+		log.Printf("Предупреждение: секция 'service' в '%s' не является объектом. Логирование и обновления не будут настроены.", serviceConfigName)
+		return nil
+	}
+
+	// 4. Проверяем наличие нашей под-секции 'shtrih_update'.
+	_, updateSectionExists := serviceMap["shtrih_update"]
+
+	// 5. Если нашей секции нет, добавляем ее и ПЕРЕСОХРАНЯЕМ ВЕСЬ ФАЙЛ.
+	if !updateSectionExists {
+		log.Printf("В секции 'service' файла '%s' отсутствует 'shtrih_update'. Добавляю по умолчанию.", serviceConfigName)
+
+		// Создаем нашу новую под-секцию
+		defaultUpdateSection := map[string]interface{}{
+			"manifest_url": defaultManifestURL,
+		}
+		// Добавляем ее в карту секции "service"
+		serviceMap["shtrih_update"] = defaultUpdateSection
+
+		// Пересохраняем всю структуру файла целиком.
+		updatedData, err := json.MarshalIndent(fileStructure, "", "    ")
+		if err != nil {
+			log.Printf("Ошибка: не удалось преобразовать обновленную конфигурацию в JSON: %v", err)
+			// Продолжаем работу со старыми данными, если не удалось сохранить
+		} else {
+			if err := os.WriteFile(serviceConfigName, updatedData, 0644); err != nil {
+				log.Printf("Ошибка: не удалось записать обновленную конфигурацию в '%s': %v", serviceConfigName, err)
+			} else {
+				log.Printf("Файл '%s' успешно обновлен секцией 'shtrih_update'.", serviceConfigName)
+			}
+		}
+	}
+
+	// 6. Теперь, когда мы уверены, что нужная секция есть, извлекаем только нужные нам поля
+	// для использования в приложении. Это безопасно и не затронет другие поля.
+	var finalConfig ServiceConfig
+
+	// Конвертируем serviceMap обратно в JSON-строку, а затем в нашу целевую структуру.
+	// Это самый надежный способ извлечь только то, что нам нужно.
+	serviceBytes, _ := json.Marshal(serviceMap)
+	if err := json.Unmarshal(serviceBytes, &finalConfig); err != nil {
+		log.Printf("Предупреждение: не удалось извлечь параметры логирования/обновления из секции 'service': %v", err)
+		return nil // Не смогли извлечь нужные поля, работаем без них.
+	}
+
+	return &finalConfig
 }
 
 func setupLogger(config *ServiceConfig) {
 	// setupLogger настраивает систему логирования на основе конфигурации.
 	// Если конфигурация не передана или повреждена, логирование продолжается в консоль.
 	// Создает директорию для логов и настраивает ротацию с использованием lumberjack.
-	if config == nil {
-		log.Printf("Предупреждение: файл настроек '%s' не найден или некорректен. Логирование продолжится в консоль.", serviceConfigName)
+	if config == nil || config.LogLevel == "" {
+		log.Printf("Предупреждение: конфигурация лога '%s' не найдена или пуста. Используем по умолчанию", serviceConfigName)
 		return
 	}
 
 	logDays := config.LogDays
 	if logDays <= 0 {
-		logDays = 7 // Значение по умолчанию
+		logDays = 14 // Значение по умолчанию
 	}
 
 	if err := os.MkdirAll(logsDir, 0755); err != nil {
@@ -135,18 +192,21 @@ func setupLogger(config *ServiceConfig) {
 		return
 	}
 
-	logFilePath := filepath.Join(logsDir, "shtrih-scanner.log")
+	//Сгенерируем имя лога с датой для корректной ротации
+	dateStr := time.Now().Format("2006-01-02")
+	logFileName := fmt.Sprintf("%s-shtrihscanner.log", dateStr)
+	logFilePath := filepath.Join(logsDir, logFileName)
 
 	lumberjackLogger := &lumberjack.Logger{
 		Filename:   logFilePath,
-		MaxSize:    5,
+		MaxSize:    2,
 		MaxBackups: 10,
 		MaxAge:     logDays,
 		Compress:   true,
 	}
 
 	log.SetOutput(io.MultiWriter(os.Stdout, lumberjackLogger))
-	log.Printf("Логирование настроено. Уровень: %s, ротация: %d дней. Файл: %s", config.LogLevel, logDays, logFilePath)
+	log.Printf("Логирование настроено. Уровень: %s, ротация: %d дней, maxSize: %d. Файл: %s", config.LogLevel, logDays, lumberjackLogger.MaxSize, logFilePath)
 }
 
 func runConfigMode(data []byte) {
