@@ -74,7 +74,8 @@ func init() {
 }
 
 // decodeLicense расшифровывает HEX-строку лицензии в человекочитаемый формат.
-// Она ищет наиболее длинное известное вхождение кода лицензии внутри всей строки.
+// ИСПРАВЛЕНА ЛОГИКА:
+// Теперь читает данные о подписках строго с позиции 16 знаков от начала строки.
 // Если лицензия не распознана, возвращает пустую строку.
 func decodeLicense(hex string) string {
 	if hex == "" {
@@ -82,12 +83,18 @@ func decodeLicense(hex string) string {
 	}
 	upperHex := strings.ToUpper(hex)
 
-	// Итерируемся по ключам, отсортированным от самого длинного к самому короткому.
-	for _, licenseCode := range sortedLicenseKeys {
-		// Проверяем, содержится ли код лицензии ГДЕ-ЛИБО в большой HEX-строке.
-		if strings.Contains(upperHex, licenseCode) {
-			info := licenseMap[licenseCode]
-			return fmt.Sprintf("Подписка до %s квартала %d года", info.quarter, info.year)
+	// Читаем данные о подписке с позиции 16 знаков от начала
+	if len(upperHex) >= 16 {
+		// Извлекаем подстроку, начиная с 16-го знака (индекс 16)
+		subscriptionHex := upperHex[16:]
+
+		// Итерируемся по ключам, отсортированным от самого длинного к самому короткому.
+		for _, licenseCode := range sortedLicenseKeys {
+			// Проверяем, начинается ли подстрока с кода лицензии
+			if strings.HasPrefix(subscriptionHex, licenseCode) {
+				info := licenseMap[licenseCode]
+				return fmt.Sprintf("Подписка до %s квартала %d года", info.quarter, info.year)
+			}
 		}
 	}
 
