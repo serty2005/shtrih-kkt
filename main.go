@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"shtrih-kkt/pkg/shtrih"
@@ -28,11 +29,29 @@ const (
 
 var (
 	outputDir = "date"
-	version   = "0.1.6"
+	version   = "0.1.7"
 )
 
 // --- СТРУКТУРЫ ДЛЯ ПАРСИНГА КОНФИГУРАЦИОННЫХ ФАЙЛОВ ---
-// Структура UpdateInfo удалена отсюда, она теперь в updater.go
+
+// Структура для передачи единого конфига от service.json
+type AppConfig struct {
+	Logging *LogConfig
+	Shtrih  *ShtrihScannerConfig
+}
+
+// Структура для чтения параметров логирования из секции "service"
+type LogConfig struct {
+	LogLevel string `json:"log_level"`
+	LogDays  int    `json:"log_days"`
+}
+
+// Структура с описанием секции strihscanner
+type ShtrihScannerConfig struct {
+	Enabled     bool   `json:"enabled"`
+	ExeName     string `json:"exe_name"`
+	ManifestURL string `json:"manifest_url"`
+}
 
 type ConfigFile struct {
 	Shtrih []ConnectionSettings `json:"shtrih"`
@@ -45,22 +64,6 @@ type ConnectionSettings struct {
 	IP          string `json:"ip"`
 	IPPort      string `json:"ip_port"`
 }
-
-type ServiceFile struct {
-	Service ServiceConfig `json:"service"`
-}
-
-type UpdateConfig struct {
-	ManifestURL string `json:"manifest_url"`
-}
-
-type ServiceConfig struct {
-	LogLevel     string       `json:"log_level"`
-	LogDays      int          `json:"log_days"`
-	UpdateURL    string       `json:"update_url,omitempty"`
-	ShtrihUpdate UpdateConfig `json:"shtrih_update"`
-}
-
 type PolledDevice struct {
 	Config shtrih.Config
 	Info   *shtrih.FiscalInfo
@@ -69,17 +72,22 @@ type PolledDevice struct {
 // --- ОСНОВНАЯ ЛОГИКА ПРИЛОЖЕНИЯ ---
 
 func main() {
+	log.Println("--- ЭТО ЗАПУСК ОБНОВЛЕННОЙ ВЕРСИИ! ---")
 	log.Printf("Запуск сбора данных по протоколу Штрих, версия: %s", version)
+
+	// Создаём вар для группы ожидания горутины обновления
+	var wg sync.WaitGroup
 
 	// Запускаем очистку старой версии в фоне. Функция находится в updater.go
 	go cleanupOldVersion()
 
-	serviceConfig := loadAndPrepareServiceConfig()
-	setupLogger(serviceConfig)
+	appConfig := loadAndPrepareServiceConfig()
+	setupLogger(appConfig.Logging)
 
 	// В фоне запускаем проверку обновлений. Функция находится в updater.go
-	if serviceConfig != nil && serviceConfig.ShtrihUpdate.ManifestURL != "" {
-		go checkForUpdates(version, serviceConfig.ShtrihUpdate.ManifestURL)
+	if appConfig.Shtrih != nil && appConfig.Shtrih.ManifestURL != "" {
+		wg.Add(1) // Добавили одну группу
+		go checkForUpdates(version, appConfig.Shtrih.ManifestURL, &wg)
 	}
 
 	configData, err := os.ReadFile(configFileName)
@@ -95,85 +103,100 @@ func main() {
 		runConfigMode(configData)
 	}
 
+	log.Println("Опрос завершен. Ожидание завершения фоновых задач")
+	wg.Wait() // Ждуль окончания горутины обновления
 	log.Println("Работа приложения завершена.")
 }
 
 // loadServiceConfig читает и парсит service.json.
-func loadAndPrepareServiceConfig() *ServiceConfig {
-	// 1. Пытаемся прочитать файл.
+func loadAndPrepareServiceConfig() *AppConfig {
+	finalConfig := &AppConfig{}
+
 	data, err := os.ReadFile(serviceConfigName)
 	if err != nil {
 		if os.IsNotExist(err) {
 			log.Printf("Файл '%s' не найден. Функции логирования и обновления будут отключены.", serviceConfigName)
-			return nil // Файла нет - ничего не делаем.
+			return finalConfig
 		}
 		log.Fatalf("Критическая ошибка чтения файла '%s': %v.", serviceConfigName, err)
 		return nil
 	}
 
-	// 2. Разбираем весь файл в универсальную карту, чтобы не потерять структуру.
 	var fileStructure map[string]interface{}
 	if err := json.Unmarshal(data, &fileStructure); err != nil {
 		log.Fatalf("Файл '%s' поврежден (невалидный JSON): %v.", serviceConfigName, err)
 		return nil
 	}
 
-	// 3. Получаем секцию "service" и проверяем, что это объект.
-	serviceRaw, serviceExists := fileStructure["service"]
-	if !serviceExists {
-		log.Printf("Предупреждение: в '%s' отсутствует секция 'service'. Логирование и обновления не будут настроены.", serviceConfigName)
-		return nil
-	}
-	serviceMap, isMap := serviceRaw.(map[string]interface{})
-	if !isMap {
-		log.Printf("Предупреждение: секция 'service' в '%s' не является объектом. Логирование и обновления не будут настроены.", serviceConfigName)
-		return nil
-	}
-
-	// 4. Проверяем наличие нашей под-секции 'shtrih_update'.
-	_, updateSectionExists := serviceMap["shtrih_update"]
-
-	// 5. Если нашей секции нет, добавляем ее и ПЕРЕСОХРАНЯЕМ ВЕСЬ ФАЙЛ.
-	if !updateSectionExists {
-		log.Printf("В секции 'service' файла '%s' отсутствует 'shtrih_update'. Добавляю по умолчанию.", serviceConfigName)
-
-		// Создаем нашу новую под-секцию
-		defaultUpdateSection := map[string]interface{}{
-			"manifest_url": defaultManifestURL,
+	// --- Шаг 1: Читаем конфиг логов ---
+	if serviceRaw, ok := fileStructure["service"]; ok {
+		var lc LogConfig
+		if serviceBytes, err := json.Marshal(serviceRaw); err == nil {
+			json.Unmarshal(serviceBytes, &lc)
+			finalConfig.Logging = &lc
 		}
-		// Добавляем ее в карту секции "service"
-		serviceMap["shtrih_update"] = defaultUpdateSection
+	}
 
-		// Пересохраняем всю структуру файла целиком.
+	// --- Шаг 2: Читаем и обогащаем существующую секцию "shtrihscanner" ---
+	var sc ShtrihScannerConfig
+	needsSave := false
+
+	shtrihScannerRaw, sectionExists := fileStructure["shtrihscanner"]
+
+	if sectionExists {
+		// Секция есть, разбираем ее в нашу структуру
+		if shtrihScannerBytes, err := json.Marshal(shtrihScannerRaw); err == nil {
+			json.Unmarshal(shtrihScannerBytes, &sc)
+		}
+	} else {
+		// Секции нет, логируем и ставим флаг на создание
+		log.Printf("В файле '%s' отсутствует секция 'shtrihscanner'. Создаю по умолчанию.", serviceConfigName)
+		needsSave = true
+	}
+
+	// --- Шаг 3: Проверяем и добавляем недостающие поля ---
+	// Эта проверка сработает как для новой, так и для неполной существующей секции.
+	if sc.ManifestURL == "" {
+		log.Printf("В секции 'shtrihscanner' отсутствует 'manifest_url'. Добавляю значение по умолчанию.")
+		sc.ManifestURL = defaultManifestURL
+		needsSave = true // Мы изменили структуру, нужно сохранить
+	}
+	if sc.ExeName == "" {
+		log.Printf("В секции 'shtrihscanner' отсутствует 'exe_name'. Добавляю имя текущего файла.")
+		exePath, _ := os.Executable()
+		sc.ExeName = filepath.Base(exePath)
+		needsSave = true // Мы изменили структуру, нужно сохранить
+	}
+	// Устанавливаем `enabled: true` только если секция создается с нуля
+	if !sectionExists {
+		sc.Enabled = true
+	}
+
+	// Записываем финальный, полный конфиг в нашу структуру
+	finalConfig.Shtrih = &sc
+
+	// --- Шаг 4: Сохраняем, если были изменения ---
+	if needsSave {
+		log.Printf("Обновляю секцию 'shtrihscanner' в файле '%s'...", serviceConfigName)
+		// Помещаем структуру обратно в общую карту
+		fileStructure["shtrihscanner"] = sc
+
 		updatedData, err := json.MarshalIndent(fileStructure, "", "    ")
 		if err != nil {
 			log.Printf("Ошибка: не удалось преобразовать обновленную конфигурацию в JSON: %v", err)
-			// Продолжаем работу со старыми данными, если не удалось сохранить
 		} else {
 			if err := os.WriteFile(serviceConfigName, updatedData, 0644); err != nil {
 				log.Printf("Ошибка: не удалось записать обновленную конфигурацию в '%s': %v", serviceConfigName, err)
 			} else {
-				log.Printf("Файл '%s' успешно обновлен секцией 'shtrih_update'.", serviceConfigName)
+				log.Printf("Файл '%s' успешно обновлен.", serviceConfigName)
 			}
 		}
 	}
 
-	// 6. Теперь, когда мы уверены, что нужная секция есть, извлекаем только нужные нам поля
-	// для использования в приложении. Это безопасно и не затронет другие поля.
-	var finalConfig ServiceConfig
-
-	// Конвертируем serviceMap обратно в JSON-строку, а затем в нашу целевую структуру.
-	// Это самый надежный способ извлечь только то, что нам нужно.
-	serviceBytes, _ := json.Marshal(serviceMap)
-	if err := json.Unmarshal(serviceBytes, &finalConfig); err != nil {
-		log.Printf("Предупреждение: не удалось извлечь параметры логирования/обновления из секции 'service': %v", err)
-		return nil // Не смогли извлечь нужные поля, работаем без них.
-	}
-
-	return &finalConfig
+	return finalConfig
 }
 
-func setupLogger(config *ServiceConfig) {
+func setupLogger(config *LogConfig) {
 	// setupLogger настраивает систему логирования на основе конфигурации.
 	// Если конфигурация не передана или повреждена, логирование продолжается в консоль.
 	// Создает директорию для логов и настраивает ротацию с использованием lumberjack.

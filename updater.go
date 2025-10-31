@@ -3,6 +3,7 @@ package main
 
 import (
 	"crypto"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -10,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"sync"
 	"time"
 
 	gover "github.com/hashicorp/go-version"
@@ -25,7 +27,8 @@ type UpdateInfo struct {
 }
 
 // checkForUpdates проверяет наличие новой версии и запускает процесс обновления.
-func checkForUpdates(currentVersion, manifestURL string) {
+func checkForUpdates(currentVersion, manifestURL string, wg *sync.WaitGroup) {
+	defer wg.Done() // Ожидающая передаёт в группу завершение горутины
 	if manifestURL == "" {
 		return
 	}
@@ -114,8 +117,14 @@ func doUpdate(updateUrl, sha256sum string) (restarted bool, err error) {
 		return false, fmt.Errorf("сервер вернул ошибку при скачивании: %s", resp.Status)
 	}
 
+	checksum, err := hex.DecodeString(sha256sum)
+	if err != nil {
+		// Эта ошибка возникнет, если в update.json будет невалидная hex-строка
+		return false, fmt.Errorf("некорректный формат checksum в манифесте: %w", err)
+	}
+
 	opts := selfupdate.Options{
-		Checksum: []byte(sha256sum),
+		Checksum: checksum,
 		Hash:     crypto.SHA256,
 	}
 
